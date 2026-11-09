@@ -1,5 +1,34 @@
 {
-  "models": {},
+  "models": {
+    "m3": {
+      "initialized": false,
+      "known": {},
+      "misses": {},
+      "outbox": [],
+      "failures": 1
+    },
+    "my": {
+      "initialized": false,
+      "known": {},
+      "misses": {},
+      "outbox": [],
+      "failures": 1
+    },
+    "ms": {
+      "initialized": false,
+      "known": {},
+      "misses": {},
+      "outbox": [],
+      "failures": 1
+    },
+    "mx": {
+      "initialized": false,
+      "known": {},
+      "misses": {},
+      "outbox": [],
+      "failures": 1
+    }
+  },
   "connection_tested": true,
-  "last_check_utc": "2026-11-09T01:36:06Z"
+  "last_check_utc": "2026-11-09T01:52:58Z"
 }
