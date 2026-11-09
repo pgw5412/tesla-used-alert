@@ -5,30 +5,30 @@
       "known": {},
       "misses": {},
       "outbox": [],
-      "failures": 6
+      "failures": 7
     },
     "my": {
       "initialized": false,
       "known": {},
       "misses": {},
       "outbox": [],
-      "failures": 6
+      "failures": 7
     },
     "ms": {
       "initialized": false,
       "known": {},
       "misses": {},
       "outbox": [],
-      "failures": 6
+      "failures": 7
     },
     "mx": {
       "initialized": false,
       "known": {},
       "misses": {},
       "outbox": [],
-      "failures": 6
+      "failures": 7
     }
   },
   "connection_tested": true,
-  "last_check_utc": "2026-11-09T09:32:20Z"
+  "last_check_utc": "2026-11-09T11:17:22Z"
 }
