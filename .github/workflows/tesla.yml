@@ -1,0 +1,325 @@
+name: Tesla used inventory alerts
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tesla-inventory
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install browser
+        run: |
+          python -m pip install 'playwright>=1.48,<2'
+          python -m playwright install --with-deps chromium
+
+      - name: Check four models
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          cat > /tmp/tesla_monitor.py <<'PYTHON'
+          import json
+          import os
+          import re
+          import time
+          import urllib.request
+          import urllib.parse
+          from pathlib import Path
+
+          STATE = Path('inventory-state.json')
+          MODEL = 'my'
+          LABEL = 'Model Y'
+          URL = ''
+
+          def save(path, data):
+              tmp = path.with_suffix('.tmp')
+              with tmp.open('w', encoding='utf-8') as f:
+                  json.dump(data, f, ensure_ascii=False, indent=2)
+                  f.flush()
+                  os.fsync(f.fileno())
+              tmp.replace(path)
+
+          def telegram(config, method, **args):
+              req = urllib.request.Request(
+                  'https://api.telegram.org/bot' + config['token'] + '/' + method,
+                  data=json.dumps(args).encode(),
+                  headers={'Content-Type': 'application/json'})
+              try:
+                  with urllib.request.urlopen(req, timeout=35) as response:
+                      data = json.load(response)
+              except Exception:
+                  raise RuntimeError(
+                      '텔레그램 요청 실패: 네트워크·토큰·채팅 설정을 확인하세요.'
+                  ) from None
+              if not data.get('ok'):
+                  raise RuntimeError('텔레그램 요청이 거절되었습니다.')
+              return data['result']
+
+          def send(config, text):
+              telegram(
+                  config, 'sendMessage',
+                  chat_id=config['chat_id'],
+                  text=text,
+                  link_preview_options={'is_disabled': True})
+
+          def parse_payload(data):
+              if not isinstance(data, dict) or 'total_matches_found' not in data:
+                  raise ValueError('조회 응답 구조 변경')
+              total = int(data['total_matches_found'])
+              rows = data.get('results')
+              if isinstance(rows, dict):
+                  rows = rows.get('exact')
+              if not isinstance(rows, list) or total < 0:
+                  raise ValueError('불완전한 목록 응답')
+              return total, rows
+
+          def fetch_inventory():
+              from playwright.sync_api import sync_playwright
+              with sync_playwright() as p:
+                  browser = p.chromium.launch(headless=True)
+                  try:
+                      page = browser.new_page(locale='ko-KR')
+                      payloads = []
+
+                      def receive(response):
+                          if (
+                              '/inventory/api/' not in response.url
+                              or 'inventory-results' not in response.url
+                          ):
+                              return
+                          try:
+                              if response.ok:
+                                  params = urllib.parse.parse_qs(
+                                      urllib.parse.urlsplit(response.url).query)
+                                  query = json.loads(params['query'][0])
+                                  filters = query['query']
+                                  if (
+                                      filters.get('model') != MODEL
+                                      or filters.get('condition') != 'used'
+                                  ):
+                                      return
+                                  total, rows = parse_payload(response.json())
+                                  payloads.append((total, rows))
+                          except Exception:
+                              pass
+
+                      page.on('response', receive)
+                      page.goto(
+                          URL,
+                          wait_until='domcontentloaded',
+                          timeout=60000)
+                      deadline = time.monotonic() + 90
+
+                      while time.monotonic() < deadline:
+                          page.wait_for_timeout(1500)
+                          body = page.locator('body').inner_text()
+                          if re.search(
+                              r'verify you are human|access denied|checking your browser',
+                              body, re.I
+                          ):
+                              raise RuntimeError('サイトへのアクセス確認が必要です。')
+
+                          if payloads:
+                              totals = {x[0] for x in payloads}
+                              if len(totals) != 1:
+                                  raise RuntimeError('조회 중 목록 합계 변경')
+                              total = next(iter(totals))
+                              vins = set()
+                              for _, rows in payloads:
+                                  for row in rows:
+                                      vin = row.get('VIN', '')
+                                      if not re.fullmatch(
+                                          r'[A-HJ-NPR-Z0-9]{17}', vin
+                                      ):
+                                          raise RuntimeError('차량 식별번호 구조 변경')
+                                      vins.add(vin)
+
+                              if len(vins) == total:
+                                  cards = page.locator(
+                                      'article[data-id]'
+                                  ).evaluate_all(
+                                      """els => els.map(e => ({
+                                          id: e.getAttribute('data-id'),
+                                          text: e.innerText
+                                      }))"""
+                                  )
+                                  texts = {
+                                      c['id'].split('-')[0]: c['text']
+                                      for c in cards
+                                  }
+                                  return {
+                                      vin: texts.get(
+                                          vin, LABEL + ' 인증중고차'
+                                      )[:1600]
+                                      for vin in sorted(vins)
+                                  }
+                          page.mouse.wheel(0, 1800)
+                      raise RuntimeError('전체 목록 확인 실패')
+                  finally:
+                      browser.close()
+
+          def transition(state, current):
+              if state is None:
+                  return {
+                      'known': current, 'misses': {}, 'outbox': []
+                  }, []
+              known = dict(state['known'])
+              misses = dict(state.get('misses', {}))
+              events = []
+              for vin, detail in current.items():
+                  if vin not in known:
+                      events.append(('🟢 차량 추가', vin, detail))
+                  known[vin] = detail
+                  misses.pop(vin, None)
+              for vin in list(known):
+                  if vin not in current:
+                      misses[vin] = misses.get(vin, 0) + 1
+                      if misses[vin] >= 2:
+                          events.append((
+                              '🔴 목록에서 사라짐 (판매완료 여부 미확인)',
+                              vin, known.pop(vin)))
+                          misses.pop(vin)
+              outbox = list(state.get('outbox', []))
+              outbox.extend(
+                  f'{kind}\nVIN: {vin}\n{detail}\n\n{URL}'
+                  for kind, vin, detail in events)
+              return {
+                  'known': known, 'misses': misses, 'outbox': outbox
+              }, events
+
+          def main():
+              global MODEL, LABEL, URL
+              config = {
+                  'token': os.environ['TELEGRAM_BOT_TOKEN'].strip(),
+                  'chat_id': os.environ['TELEGRAM_CHAT_ID'].strip()
+              }
+              if not config['token'] or not config['chat_id']:
+                  raise RuntimeError('GitHub Secrets 두 항목을 확인하세요.')
+              state = (
+                  json.loads(STATE.read_text())
+                  if STATE.exists() else {'models': {}}
+              )
+              telegram(config, 'getMe')
+              if not state.get('connection_tested'):
+                  send(
+                      config,
+                      '✅ GitHub ↔ 텔레그램 연결 성공. '
+                      'Model 3/Y/S/X 조회를 시작합니다. '
+                      '조회 성공 여부는 별도로 알려드립니다.')
+                  state['connection_tested'] = True
+                  save(STATE, state)
+
+              failed = []
+              summary = []
+              manual = (
+                  os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch'
+              )
+              models = [
+                  ('m3', 'Model 3'), ('my', 'Model Y'),
+                  ('ms', 'Model S'), ('mx', 'Model X')
+              ]
+              for MODEL, LABEL in models:
+                  URL = (
+                      'https://www.tesla.com/ko_KR/inventory/used/'
+                      f'{MODEL}?arrangeby=plh&zip=&range=0'
+                  )
+                  old = state['models'].get(MODEL)
+                  try:
+                      if old:
+                          while old.get('outbox'):
+                              send(config, old['outbox'][0])
+                              old['outbox'].pop(0)
+                              save(STATE, state)
+                              time.sleep(1)
+
+                      current = fetch_inventory()
+                      new, events = transition(old, current)
+                      for i in range(len(new['outbox'])):
+                          new['outbox'][i] = (
+                              LABEL + '\n' + new['outbox'][i]
+                          )
+                      if old is None:
+                          new['outbox'].append(
+                              f'✅ {LABEL}: {len(current)}대 기준 저장 완료. '
+                              '이후 변화를 알립니다.')
+                      new['failures'] = 0
+                      state['models'][MODEL] = new
+                      save(STATE, state)
+                      while new['outbox']:
+                          send(config, new['outbox'][0])
+                          new['outbox'].pop(0)
+                          save(STATE, state)
+                          time.sleep(1)
+                      summary.append(f'{LABEL}: {len(current)}대 정상')
+                      print(
+                          LABEL, len(current), 'vehicles;',
+                          len(events), 'changes', flush=True)
+                  except Exception as exc:
+                      failed.append(LABEL)
+                      previous = state['models'].get(MODEL)
+                      if previous:
+                          previous['failures'] = (
+                              previous.get('failures', 0) + 1
+                          )
+                          previous['misses'] = {}
+                      count = previous['failures'] if previous else 1
+                      if count in (1, 3):
+                          try:
+                              send(
+                                  config,
+                                  f'⚠️ {LABEL} 조회 또는 전송 실패. '
+                                  '기존 목록을 유지합니다. '
+                                  'GitHub Actions 실행 결과를 확인하세요. '
+                                  f'오류: {type(exc).__name__}')
+                          except Exception:
+                              pass
+                      summary.append(f'{LABEL}: 실패')
+                      print(
+                          LABEL, 'failed:',
+                          type(exc).__name__, flush=True)
+                      save(STATE, state)
+                  time.sleep(3)
+
+              state['last_check_utc'] = time.strftime(
+                  '%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+              save(STATE, state)
+              if manual:
+                  send(config, '수동 점검 결과\n' + '\n'.join(summary))
+              if failed:
+                  raise SystemExit(1)
+
+          if __name__ == '__main__':
+              main()
+          PYTHON
+          python /tmp/tesla_monitor.py
+
+      - name: Save inventory state
+        if: always()
+        run: |
+          if [ -f inventory-state.json ]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add inventory-state.json
+            if ! git diff --cached --quiet; then
+              git commit -m 'Update inventory snapshot'
+              git push
+            fi
+          fi
